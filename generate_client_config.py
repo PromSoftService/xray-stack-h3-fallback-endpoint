@@ -1,8 +1,10 @@
 #!/usr/bin/env python3
+
+# py generate_client_config.py DOMAIN UUID PATH --doh https://1.1.1.1/dns-query -o client-config.json
+
 import argparse
 import json
 from pathlib import Path
-
 
 def normalize_path(path: str) -> str:
     if not path.startswith("/"):
@@ -82,7 +84,7 @@ def build_config(domain: str, uuid: str, path: str, doh_url: str) -> dict:
                     "xhttpSettings": {
                         "host": domain,
                         "path": normalized_path,
-                        "mode": "packet-up"
+                        "mode": "auto"
                     }
                 }
             },
