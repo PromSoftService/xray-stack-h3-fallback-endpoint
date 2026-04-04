@@ -1,0 +1,33 @@
+services:
+  xray:
+    image: ${XRAY_IMAGE}
+    container_name: xray
+    restart: unless-stopped
+    expose:
+      - "${XRAY_PORT}"
+    volumes:
+      - ./xray/config.json:/etc/xray/config.json:ro
+
+  nginx:
+    image: ${NGINX_IMAGE}
+    container_name: nginx
+    restart: unless-stopped
+    depends_on:
+      - xray
+    ports:
+      - "80:80/tcp"
+      - "443:443/tcp"
+      - "443:443/udp"
+    volumes:
+      - ./nginx/conf.d:/etc/nginx/conf.d:ro
+      - ./site:/usr/share/nginx/html:ro
+      - ./certbot/www:/var/www/certbot
+      - ./certbot/conf:/etc/letsencrypt
+
+  certbot:
+    image: ${CERTBOT_IMAGE}
+    container_name: certbot
+    profiles: ["manual"]
+    volumes:
+      - ./certbot/www:/var/www/certbot
+      - ./certbot/conf:/etc/letsencrypt

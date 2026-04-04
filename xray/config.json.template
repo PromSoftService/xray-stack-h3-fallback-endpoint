@@ -1,0 +1,43 @@
+{
+  "log": {
+    "loglevel": "__XRAY_LOGLEVEL__"
+  },
+  "dns": {
+    "servers": [
+      "__DOH_URL__"
+    ]
+  },
+  "inbounds": [
+    {
+      "tag": "in-vless-xhttp",
+      "listen": "0.0.0.0",
+      "port": __XRAY_PORT__,
+      "protocol": "vless",
+      "settings": {
+        "clients": [
+          {
+            "id": "__XRAY_UUID__"
+          }
+        ],
+        "decryption": "none"
+      },
+      "streamSettings": {
+        "network": "xhttp",
+        "xhttpSettings": {
+          "path": "__XRAY_PATH__",
+          "mode": "__XRAY_XHTTP_MODE__"
+        }
+      }
+    }
+  ],
+  "outbounds": [
+    {
+      "tag": "direct",
+      "protocol": "freedom"
+    },
+    {
+      "tag": "block",
+      "protocol": "blackhole"
+    }
+  ]
+}
