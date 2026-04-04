@@ -10,6 +10,7 @@ if [[ ! -f ".env" ]]; then
 fi
 
 set -a
+# shellcheck disable=SC1091
 source .env
 set +a
 
@@ -50,6 +51,73 @@ if [[ "${VERIFY_HTTP3_IMAGE:-yes}" == "yes" ]]; then
   fi
 fi
 
+normalize_path() {
+  local value="$1"
+
+  if [[ -z "$value" ]]; then
+    echo "/"
+    return
+  fi
+
+  if [[ "$value" != /* ]]; then
+    value="/$value"
+  fi
+
+  if [[ "$value" != "/" && "$value" != */ ]]; then
+    value="${value}/"
+  fi
+
+  echo "$value"
+}
+
+escape_sed() {
+  printf '%s' "$1" | sed -e 's/[\/&]/\\&/g'
+}
+
+replace_token() {
+  local file="$1"
+  local token="$2"
+  local value="$3"
+  sed -i "s/${token}/$(escape_sed "$value")/g" "$file"
+}
+
+prepare_cert_permissions() {
+  local live_dir="certbot/conf/live/${DOMAIN}"
+  local archive_dir="certbot/conf/archive/${DOMAIN}"
+
+  if [[ ! -d "$live_dir" || ! -d "$archive_dir" ]]; then
+    echo "ERROR: certificate directories not found for domain ${DOMAIN}"
+    exit 1
+  fi
+
+  chmod 755 certbot/conf/live
+  chmod 755 certbot/conf/archive
+  chmod 755 "$live_dir"
+  chmod 755 "$archive_dir"
+
+  shopt -s nullglob
+  local fullchain_files=("$archive_dir"/fullchain*.pem)
+  local privkey_files=("$archive_dir"/privkey*.pem)
+  shopt -u nullglob
+
+  if [[ ${#fullchain_files[@]} -eq 0 ]]; then
+    echo "ERROR: fullchain*.pem not found in $archive_dir"
+    exit 1
+  fi
+
+  if [[ ${#privkey_files[@]} -eq 0 ]]; then
+    echo "ERROR: privkey*.pem not found in $archive_dir"
+    exit 1
+  fi
+
+  chmod 644 "${fullchain_files[@]}"
+  chmod 644 "${privkey_files[@]}"
+
+  echo "Adjusted certificate permissions for rootless nginx."
+}
+
+XRAY_PATH_NORMALIZED="$(normalize_path "$XRAY_PATH")"
+
 if [[ ! -f site/index.html ]]; then
   cat > site/index.html <<'HTML'
 <!doctype html>
@@ -83,30 +151,22 @@ fi
 
 cp xray/config.json.template xray/config.json
 
-escape_sed() {
-  printf '%s' "$1" | sed -e 's/[\/&]/\\&/g'
-}
-
-replace_token() {
-  local file="$1"
-  local token="$2"
-  local value="$3"
-  sed -i "s/${token}/$(escape_sed "$value")/g" "$file"
-}
-
 replace_token xray/config.json "__XRAY_LOGLEVEL__" "$XRAY_LOGLEVEL"
 replace_token xray/config.json "__DOH_URL__" "$DOH_URL"
 replace_token xray/config.json "__XRAY_PORT__" "$XRAY_PORT"
 replace_token xray/config.json "__XRAY_UUID__" "$XRAY_UUID"
-replace_token xray/config.json "__XRAY_PATH__" "$XRAY_PATH"
+replace_token xray/config.json "__XRAY_PATH__" "$XRAY_PATH_NORMALIZED"
 replace_token xray/config.json "__XRAY_XHTTP_MODE__" "$XRAY_XHTTP_MODE"
 
 CERT_DIR="certbot/conf/live/${DOMAIN}"
+
 if [[ -f "${CERT_DIR}/fullchain.pem" && -f "${CERT_DIR}/privkey.pem" ]]; then
   echo "Certificate found. Generating full TLS + H3/H2 nginx config..."
+  prepare_cert_permissions
+
   cp nginx/conf.d/default.conf.template nginx/conf.d/default.conf
   replace_token nginx/conf.d/default.conf "__DOMAIN__" "$DOMAIN"
-  replace_token nginx/conf.d/default.conf "__XRAY_PATH__" "$XRAY_PATH"
+  replace_token nginx/conf.d/default.conf "__XRAY_PATH__" "$XRAY_PATH_NORMALIZED"
   replace_token nginx/conf.d/default.conf "__XRAY_PORT__" "$XRAY_PORT"
   replace_token nginx/conf.d/default.conf "__NGINX_HTTP2__" "$NGINX_HTTP2"
   replace_token nginx/conf.d/default.conf "__NGINX_HTTP3__" "$NGINX_HTTP3"
@@ -114,30 +174,36 @@ if [[ -f "${CERT_DIR}/fullchain.pem" && -f "${CERT_DIR}/privkey.pem" ]]; then
   replace_token nginx/conf.d/default.conf "__NGINX_HSTS_MAX_AGE__" "$NGINX_HSTS_MAX_AGE"
   replace_token nginx/conf.d/default.conf "__NGINX_PROXY_READ_TIMEOUT__" "$NGINX_PROXY_READ_TIMEOUT"
   replace_token nginx/conf.d/default.conf "__NGINX_PROXY_SEND_TIMEOUT__" "$NGINX_PROXY_SEND_TIMEOUT"
+
+  MODE_MESSAGE="TLS certificate present. nginx should serve HTTPS + HTTP/3 + H2 fallback."
 else
-  echo "Certificate not found yet. Generating bootstrap HTTP-only nginx config for ACME..."
+  echo "Certificate not found. Generating bootstrap HTTP-only nginx config for ACME..."
   cp nginx/conf.d/bootstrap.conf.template nginx/conf.d/default.conf
   replace_token nginx/conf.d/default.conf "__DOMAIN__" "$DOMAIN"
+
+  MODE_MESSAGE="Bootstrap mode enabled. Only HTTP/80 is expected until certificate is issued."
 fi
 
 echo
 echo "Generated files:"
 echo "  xray/config.json"
 echo "  nginx/conf.d/default.conf"
-echo
 
+echo
 echo "Starting xray and nginx..."
 docker compose up -d xray nginx
-echo
-
-if [[ -f "${CERT_DIR}/fullchain.pem" && -f "${CERT_DIR}/privkey.pem" ]]; then
-  echo "TLS certificate already present. nginx should now serve HTTPS + HTTP/3 + H2 fallback."
-else
-  echo "Issue certificate with:"
-  echo "docker compose run --rm certbot certonly --webroot -w /var/www/certbot -d ${DOMAIN} --email ${EMAIL} --agree-tos --no-eff-email"
-  echo
-  echo "Then run again:"
-  echo "./init.sh"
-fi
 
 echo
+echo "Reloading generated configs..."
+docker compose restart xray nginx
+
+echo
+echo "${MODE_MESSAGE}"
+
+echo
+echo "===== xray/config.json ====="
+sed -n '1,240p' xray/config.json
+
+echo
+echo "===== nginx/conf.d/default.conf ====="
+sed -n '1,260p' nginx/conf.d/default.conf

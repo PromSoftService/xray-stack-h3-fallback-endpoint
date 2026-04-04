@@ -173,7 +173,7 @@ xray-stack-h3-fallback/
     conf/
 ```
 
-При необходимости создай каталоги:
+Создай каталоги:
 
 ```bash
 mkdir -p nginx/conf.d xray site certbot/www certbot/conf
@@ -192,6 +192,12 @@ nano .env
 
 ### 3.1. Что обязательно заполнить
 
+Сгенерируй UUID:
+
+```bash
+cat /proc/sys/kernel/random/uuid
+```
+
 Проверь и задай:
 
 - `DOMAIN` — твой домен
@@ -200,10 +206,6 @@ nano .env
 - `XRAY_PATH` — секретный HTTP path
 - `XRAY_PORT` — внутренний порт Xray
 
-UUID можно сгенерировать так:
-
-```bash
-cat /proc/sys/kernel/random/uuid
 ```
 
 ### 3.2. Пример ключевых значений
@@ -271,6 +273,10 @@ chmod +x init.sh renew.sh check-h3.sh
 
 ```bash
 docker compose ps
+sudo ss -ltnp | grep ':80'
+sudo ss -ltnp | grep ':443'
+sudo ss -lunp | grep ':443'
+sudo ufw status
 ```
 
 Если всё нормально, сайт по HTTP должен открываться, а `/.well-known/acme-challenge/` должен обслуживаться nginx.
@@ -278,7 +284,7 @@ docker compose ps
 Можно проверить так:
 
 ```bash
-curl -I http://your-domain.com
+curl.exe -I http://your-domain.com
 ```
 
 Обычно здесь будет редирект или HTTP-ответ bootstrap-конфига в зависимости от шаблона.
@@ -307,14 +313,16 @@ docker compose run --rm certbot certonly \
 
 Если сертификат выпустился успешно, файлы появятся в каталоге:
 
-```text
-./certbot/conf/live/your-domain.com/
+```bash
+ls ./certbot/conf/live/your-domain.com/
 ```
 
 Обычно там будут:
 
+```
 - `fullchain.pem`
 - `privkey.pem`
+```
 
 ---
 
@@ -336,6 +344,20 @@ docker compose run --rm certbot certonly \
 
 ```bash
 docker compose ps
+```
+
+Если всё нормально, сайт по HTTPS должен открываться.
+
+Можно проверить так:
+
+```bash
+curl.exe -I https://your-domain.com
+```
+
+Проверить H3:
+
+```bash
+py .\check_h3.py https://your-domain.com
 ```
 
 ---
@@ -403,13 +425,7 @@ curl -I https://your-domain.com
 ### 10.7. Проверка HTTP/3
 
 ```bash
-curl -I --http3 https://your-domain.com
-```
-
-### 10.8. Проверка negotiated H3
-
-```bash
-curl -I --http3 https://your-domain.com | grep -i quic-status
+py .\check_h3.py https://your-domain.com
 ```
 
 ---
@@ -426,6 +442,12 @@ curl -I --http3 https://your-domain.com | grep -i quic-status
 - `security` = `tls`
 - `serverName / SNI` = `DOMAIN`
 - `ALPN` = можно пробовать `h3`
+
+Сгенерировать клиентский конфиг:
+
+```bash
+python generate_client_config.py DOMAIN XRAY_UUID /XRAY_PATH
+```
 
 ---
 

@@ -6,7 +6,7 @@ services:
     expose:
       - "${XRAY_PORT}"
     volumes:
-      - ./xray/config.json:/etc/xray/config.json:ro
+      - ./xray:/usr/local/etc/xray:ro
 
   nginx:
     image: ${NGINX_IMAGE}
