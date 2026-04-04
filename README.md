@@ -45,12 +45,6 @@
 ping your-domain.com
 ```
 
-Или:
-
-```bash
-dig +short your-domain.com
-```
-
 IP должен совпадать с адресом твоего сервера.
 
 ### 1.3. Открытые порты
@@ -82,12 +76,6 @@ sudo apt upgrade -y
 sudo apt install -y ca-certificates curl gnupg lsb-release openssl unzip jq
 ```
 
-Если раньше ставились конфликтующие docker-пакеты:
-
-```bash
-sudo apt remove -y docker.io docker-compose docker-compose-v2 docker-doc podman-docker containerd runc || true
-```
-
 Установка Docker Engine:
 
 ```bash
@@ -106,8 +94,62 @@ echo \
 ```
 
 ```bash
+cat > install-docker.sh <<'EOF'
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+export DEBIAN_FRONTEND=noninteractive
+
+echo "==> remove old docker packages if present"
+sudo apt remove -y docker.io docker-compose docker-compose-v2 docker-doc podman-docker containerd runc || true
+
+echo "==> install dependencies"
+sudo apt install -y ca-certificates curl
+
+echo "==> prepare keyrings"
+sudo install -m 0755 -d /etc/apt/keyrings
+
+echo "==> remove old docker repo files"
+sudo rm -f /etc/apt/sources.list.d/docker.list
+sudo rm -f /etc/apt/sources.list.d/docker.sources
+sudo rm -f /etc/apt/keyrings/docker.asc
+
+echo "==> download docker gpg key"
+curl -fsSL https://download.docker.com/linux/ubuntu/gpg | sudo tee /etc/apt/keyrings/docker.asc > /dev/null
+sudo chmod a+r /etc/apt/keyrings/docker.asc
+
+ARCH="$(dpkg --print-architecture)"
+. /etc/os-release
+CODENAME="${UBUNTU_CODENAME:-$VERSION_CODENAME}"
+
+echo "==> create docker.sources"
+cat <<EOT | sudo tee /etc/apt/sources.list.d/docker.sources > /dev/null
+Types: deb
+URIs: https://download.docker.com/linux/ubuntu
+Suites: ${CODENAME}
+Components: stable
+Architectures: ${ARCH}
+Signed-By: /etc/apt/keyrings/docker.asc
+EOT
+
+echo "==> apt update"
 sudo apt update
+
+echo "==> install docker"
 sudo apt install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
+
+echo "==> enable and start docker"
+sudo systemctl enable docker
+sudo systemctl start docker
+
+echo "==> docker version"
+docker --version
+docker compose version
+
+echo "==> done"
+EOF
+chmod +x install-docker.sh
+./install-docker.sh
 ```
 
 Проверка:
@@ -183,6 +225,12 @@ mkdir -p nginx/conf.d xray site certbot/www certbot/conf
 
 ## 3. Подготовка `.env`
 
+Сгенерируй UUID:
+
+```bash
+cat /proc/sys/kernel/random/uuid
+```
+
 Создай рабочий `.env` на основе шаблона:
 
 ```bash
@@ -190,13 +238,7 @@ cp .env.example .env
 nano .env
 ```
 
-### 3.1. Что обязательно заполнить
-
-Сгенерируй UUID:
-
-```bash
-cat /proc/sys/kernel/random/uuid
-```
+### Что обязательно заполнить
 
 Проверь и задай:
 
@@ -206,9 +248,7 @@ cat /proc/sys/kernel/random/uuid
 - `XRAY_PATH` — секретный HTTP path
 - `XRAY_PORT` — внутренний порт Xray
 
-```
-
-### 3.2. Пример ключевых значений
+### Пример ключевых значений
 
 ```env
 DOMAIN=your-domain.com
@@ -230,199 +270,124 @@ chmod +x init.sh renew.sh check-h3.sh
 
 ---
 
-## 5. Что делает `init.sh`
+## 5. Что делают скрипты
 
-Скрипт выполняет две разные роли в зависимости от того, есть ли уже сертификат.
+В проекте теперь используются **3 основных скрипта**:
 
-### Если сертификата еще нет
-
-`init.sh`:
-
-- проверяет `.env`
-- генерирует конфиги
-- включает **bootstrap-конфиг nginx только по HTTP**
-- поднимает `xray` и `nginx`
-- подготавливает сервер к выпуску сертификата через `certbot --webroot`
-
-### Если сертификат уже есть
-
-`init.sh`:
-
-- генерирует полноценный TLS-конфиг
-- включает:
-  - HTTPS
-  - HTTP/3
-  - HTTP/2 fallback
-- перезапускает сервисы в нужном состоянии
-
-То есть `init.sh` можно безопасно запускать и **до**, и **после** выпуска сертификата.
+- `./init.sh` — основной сценарий развертывания
+- `./renew.sh` — выпуск или продление сертификатов
+- `./check-h3.sh` — глубокая диагностика
 
 ---
 
 ## 6. Первый запуск
 
-Запусти:
+для полного первого развертывания достаточно выполнить:
 
 ```bash
 ./init.sh
 ```
 
-После этого должны стартовать контейнеры `xray` и `nginx` в bootstrap-режиме.
+Что произойдет:
 
-Проверь:
+1. будут сгенерированы конфиги Xray и nginx
+2. если сертификата нет, будет поднят bootstrap nginx по HTTP
+3. будет автоматически вызван `./renew.sh issue`
+4. будет выпущен сертификат Let's Encrypt
+5. nginx будет переведен в боевой TLS/H3/H2 режим
+6. весь стек будет запущен
 
-```bash
-docker compose ps
-sudo ss -ltnp | grep ':80'
-sudo ss -ltnp | grep ':443'
-sudo ss -lunp | grep ':443'
-sudo ufw status
-```
-
-Если всё нормально, сайт по HTTP должен открываться, а `/.well-known/acme-challenge/` должен обслуживаться nginx.
-
-Можно проверить так:
-
-```bash
-curl.exe -I http://your-domain.com
-```
-
-Обычно здесь будет редирект или HTTP-ответ bootstrap-конфига в зависимости от шаблона.
+То есть отдельная ручная команда `certbot certonly ...` больше не нужна.
 
 ---
 
-## 7. Выпуск сертификата Let's Encrypt
+## 7. Глубокая проверка после запуска
 
-После первого запуска выпусти сертификат:
-
-```bash
-docker compose run --rm certbot certonly \
-  --webroot -w /var/www/certbot \
-  -d your-domain.com \
-  --email you@example.com \
-  --agree-tos \
-  --no-eff-email
-```
-
-### Важно
-
-Здесь:
-
-- `your-domain.com` замени на свой домен
-- `you@example.com` замени на свой email
-
-Если сертификат выпустился успешно, файлы появятся в каталоге:
-
-```bash
-ls ./certbot/conf/live/your-domain.com/
-```
-
-Обычно там будут:
-
-```
-- `fullchain.pem`
-- `privkey.pem`
-```
-
----
-
-## 8. Переключение в боевой режим HTTPS + H3 + H2
-
-После успешного выпуска сертификата **еще раз** запусти:
-
-```bash
-./init.sh
-```
-
-Теперь скрипт увидит готовый сертификат и переключит nginx на полноценный конфиг:
-
-- `443/tcp` для HTTPS/H2
-- `443/udp` для HTTP/3/QUIC
-- proxy до Xray
-
-Проверь, что контейнеры подняты:
-
-```bash
-docker compose ps
-```
-
-Если всё нормально, сайт по HTTPS должен открываться.
-
-Можно проверить так:
-
-```bash
-curl.exe -I https://your-domain.com
-```
-
-Проверить H3:
-
-```bash
-py .\check_h3.py https://your-domain.com
-```
-
----
-
-## 9. Полная проверка
-
-Запусти встроенный скрипт проверки:
+После `./init.sh` для полной runtime-проверки выполни:
 
 ```bash
 ./check-h3.sh
 ```
 
-Он проверяет:
+---
 
-1. наличие `--with-http_v3_module` в образе nginx
-2. синтаксис runtime-конфига nginx
-3. нужные директивы в сгенерированном конфиге
-4. прослушивание TCP/443 и UDP/443
-5. состояние контейнеров
-6. обычный HTTPS
-7. HTTP/3
-8. заголовок `QUIC-Status`
+## 8. Ручной перевыпуск или продление сертификатов
+
+Если нужно вручную заново заняться сертификатами, используй:
+
+### Выпуск, если сертификата еще нет
+
+```bash
+./renew.sh issue
+```
+
+### Продление существующего сертификата
+
+```bash
+./renew.sh renew
+```
+
+После ручного продления рекомендуется снова привести стек в рабочее состояние:
+
+```bash
+./init.sh
+```
+
+И затем, при необходимости, выполнить глубокую диагностику:
+
+```bash
+./check-h3.sh
+```
 
 ---
 
-## 10. Проверки вручную
+## 9. Рекомендуемый практический сценарий
 
-### 10.1. Проверка поддержки HTTP/3 в образе nginx
-
-```bash
-docker run --rm "${NGINX_IMAGE}" nginx -V 2>&1 | grep -- --with-http_v3_module
-```
-
-### 10.2. Полная строка сборки nginx
+### Первый запуск с нуля
 
 ```bash
-docker run --rm "${NGINX_IMAGE}" nginx -V 2>&1
+chmod +x init.sh renew.sh check-h3.sh
+./init.sh
+./check-h3.sh
 ```
 
-### 10.3. Проверка синтаксиса nginx
+### Обычный повторный запуск после правок `.env` или шаблонов
 
 ```bash
-docker compose exec nginx nginx -t
+./init.sh
 ```
 
-### 10.4. Проверка активных директив
+### Глубокая диагностика
 
 ```bash
-grep -nE 'listen 443|http2|http3|Alt-Svc|QUIC-Status' nginx/conf.d/default.conf
+./check-h3.sh
 ```
 
-### 10.5. Проверка сокетов на хосте
+### Ручное продление сертификатов
 
 ```bash
-sudo ss -ltnp | grep ':443'
-sudo ss -lunp | grep ':443'
+./renew.sh renew
+./init.sh
 ```
 
-### 10.6. Проверка HTTPS
+---
+
+## 10. Краткая логика использования
+
+- `./init.sh` — **развернуть и запустить всё**
+- `./renew.sh` — **заняться сертификатами**
+- `./check-h3.sh` — **глубоко проверить и смотреть логи**
+
+
+---
+
+### 10.1. Проверка HTTPS
 
 ```bash
 curl -I https://your-domain.com
 ```
 
-### 10.7. Проверка HTTP/3
+### 10.2. Проверка HTTP/3
 
 ```bash
 py .\check_h3.py https://your-domain.com
@@ -430,28 +395,7 @@ py .\check_h3.py https://your-domain.com
 
 ---
 
-## 11. Что указывать в клиенте Xray/VLESS
-
-Используй следующие параметры:
-
-- `address` = `DOMAIN`
-- `port` = `443`
-- `uuid` = `XRAY_UUID`
-- `network` = `xhttp`
-- `path` = `XRAY_PATH`
-- `security` = `tls`
-- `serverName / SNI` = `DOMAIN`
-- `ALPN` = можно пробовать `h3`
-
-Сгенерировать клиентский конфиг:
-
-```bash
-python generate_client_config.py DOMAIN XRAY_UUID /XRAY_PATH
-```
-
----
-
-## 12. Что значит fallback в этой схеме
+## 11. Что значит fallback в этой схеме
 
 Здесь fallback — это не отдельная функция Xray.
 
@@ -464,47 +408,13 @@ python generate_client_config.py DOMAIN XRAY_UUID /XRAY_PATH
 
 ---
 
-## 13. Что делать после развертывания
-
-После успешного запуска стоит выполнить несколько практических шагов.
-
-### 13.1. Проверить доступность снаружи
-
-Проверь сайт и H3 не только с сервера, но и с другой машины или устройства.
-
-### 13.2. Проверить firewall/провайдера
-
-Если HTTPS работает, а HTTP/3 нет, чаще всего проблема в одном из пунктов:
-
-- не открыт `443/udp`
-- облачный firewall режет UDP
-- провайдер/VPS-панель не пропускает QUIC
-
-### 13.3. Проверить логи
-
-```bash
-docker compose logs --tail=200 nginx
-docker compose logs --tail=200 xray
-```
-
-### 13.4. Убедиться, что домен действительно указывает на этот сервер
-
-Если сертификат не выпускается, первое, что надо проверить — DNS и доступность `http://DOMAIN/.well-known/acme-challenge/...`
-
----
-
-## 14. Обновление сертификатов
+## 12. Обновление сертификатов
 
 Для ручного продления предусмотрен скрипт:
 
 ```bash
 ./renew.sh
 ```
-
-Он:
-
-- запускает `certbot renew`
-- затем обновляет состояние nginx
 
 Рекомендуется добавить это в cron.
 
@@ -524,151 +434,3 @@ crontab -e
 
 ---
 
-## 15. Полезные команды эксплуатации
-
-### Поднять сервисы
-
-```bash
-docker compose up -d
-```
-
-### Перезапустить сервисы
-
-```bash
-docker compose restart
-```
-
-### Остановить сервисы
-
-```bash
-docker compose down
-```
-
-### Посмотреть статус
-
-```bash
-docker compose ps
-```
-
-### Логи nginx
-
-```bash
-docker compose logs -f nginx
-```
-
-### Логи xray
-
-```bash
-docker compose logs -f xray
-```
-
----
-
-## 16. Самый короткий сценарий
-
-Если всё уже подготовлено, минимальная последовательность такая:
-
-```bash
-cp .env.example .env
-nano .env
-chmod +x init.sh renew.sh check-h3.sh
-./init.sh
-
-docker compose run --rm certbot certonly \
-  --webroot -w /var/www/certbot \
-  -d your-domain.com \
-  --email you@example.com \
-  --agree-tos \
-  --no-eff-email
-
-./init.sh
-./check-h3.sh
-```
-
----
-
-## 17. Если что-то не работает
-
-### Симптом: `certbot` не может выпустить сертификат
-
-Проверь:
-
-- домен указывает на VPS
-- порт `80/tcp` открыт
-- nginx уже запущен в bootstrap-режиме
-- нет другого процесса, который занял 80 порт
-
-Проверка:
-
-```bash
-docker compose ps
-sudo ss -ltnp | grep ':80'
-```
-
-### Симптом: HTTPS работает, а `curl --http3` нет
-
-Проверь:
-
-- открыт ли `443/udp`
-- слушает ли система UDP/443
-- реально ли образ nginx собран с `--with-http_v3_module`
-
-### Симптом: nginx не стартует после выпуска сертификата
-
-Проверь:
-
-- существуют ли файлы `fullchain.pem` и `privkey.pem`
-- совпадает ли домен в `.env` с фактическим путем сертификата
-- проходит ли `nginx -t`
-
-### Симптом: Xray не принимает трафик
-
-Проверь:
-
-- правильный ли `XRAY_PATH`
-- совпадает ли `uuid`
-- корректен ли клиентский профиль
-- жив ли контейнер `xray`
-
----
-
-## 18. Итоговая логика развертывания
-
-Весь процесс выглядит так:
-
-1. подготовить сервер, DNS и порты
-2. установить Docker
-3. положить файлы проекта в каталог
-4. создать `.env`
-5. сделать скрипты исполняемыми
-6. выполнить `./init.sh` для bootstrap-режима
-7. выпустить сертификат через `certbot`
-8. снова выполнить `./init.sh`
-9. проверить работу через `./check-h3.sh`
-10. настроить клиент Xray
-11. добавить регулярное продление сертификата
-
----
-
-## 19. Рекомендуемый порядок команд целиком
-
-```bash
-mkdir -p ~/xray-stack-h3-fallback
-cd ~/xray-stack-h3-fallback
-
-cp .env.example .env
-nano .env
-
-chmod +x init.sh renew.sh check-h3.sh
-./init.sh
-
-docker compose run --rm certbot certonly \
-  --webroot -w /var/www/certbot \
-  -d your-domain.com \
-  --email you@example.com \
-  --agree-tos \
-  --no-eff-email
-
-./init.sh
-./check-h3.sh
-```

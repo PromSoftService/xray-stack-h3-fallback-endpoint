@@ -14,7 +14,10 @@ set -a
 source .env
 set +a
 
-mkdir -p nginx/conf.d xray site certbot/www certbot/conf
+echo "Checking sudo access..."
+sudo -v
+
+mkdir -p nginx/conf.d xray site certbot/www certbot/conf generated
 
 required_vars=(
   DOMAIN
@@ -43,13 +46,10 @@ for var_name in "${required_vars[@]}"; do
   fi
 done
 
-if [[ "${VERIFY_HTTP3_IMAGE:-yes}" == "yes" ]]; then
-  echo "Checking nginx image for --with-http_v3_module..."
-  if ! docker run --rm "${NGINX_IMAGE}" nginx -V 2>&1 | grep -q -- '--with-http_v3_module'; then
-    echo "ERROR: nginx image does not include --with-http_v3_module"
-    exit 1
-  fi
-fi
+log() {
+  echo
+  echo "== $* =="
+}
 
 normalize_path() {
   local value="$1"
@@ -81,45 +81,37 @@ replace_token() {
   sed -i "s/${token}/$(escape_sed "$value")/g" "$file"
 }
 
+verify_nginx_http3_image() {
+  if [[ "${VERIFY_HTTP3_IMAGE:-yes}" == "yes" ]]; then
+    log "Checking nginx image for --with-http_v3_module"
+    if ! docker run --rm "${NGINX_IMAGE}" nginx -V 2>&1 | grep -q -- '--with-http_v3_module'; then
+      echo "ERROR: nginx image does not include --with-http_v3_module"
+      exit 1
+    fi
+  fi
+}
+
 prepare_cert_permissions() {
   local live_dir="certbot/conf/live/${DOMAIN}"
   local archive_dir="certbot/conf/archive/${DOMAIN}"
 
-  if [[ ! -d "$live_dir" || ! -d "$archive_dir" ]]; then
-    echo "ERROR: certificate directories not found for domain ${DOMAIN}"
-    exit 1
+  sudo chmod 755 certbot/conf || true
+  sudo chmod 755 certbot/conf/live || true
+  sudo chmod 755 certbot/conf/archive || true
+
+  if [[ -d "$live_dir" ]]; then
+    sudo chmod 755 "$live_dir" || true
   fi
 
-  chmod 755 certbot/conf/live
-  chmod 755 certbot/conf/archive
-  chmod 755 "$live_dir"
-  chmod 755 "$archive_dir"
-
-  shopt -s nullglob
-  local fullchain_files=("$archive_dir"/fullchain*.pem)
-  local privkey_files=("$archive_dir"/privkey*.pem)
-  shopt -u nullglob
-
-  if [[ ${#fullchain_files[@]} -eq 0 ]]; then
-    echo "ERROR: fullchain*.pem not found in $archive_dir"
-    exit 1
+  if [[ -d "$archive_dir" ]]; then
+    sudo chmod 755 "$archive_dir" || true
+    sudo find "$archive_dir" -type f -name '*.pem' -exec chmod 644 {} \; || true
   fi
-
-  if [[ ${#privkey_files[@]} -eq 0 ]]; then
-    echo "ERROR: privkey*.pem not found in $archive_dir"
-    exit 1
-  fi
-
-  chmod 644 "${fullchain_files[@]}"
-  chmod 644 "${privkey_files[@]}"
-
-  echo "Adjusted certificate permissions for rootless nginx."
 }
 
-XRAY_PATH_NORMALIZED="$(normalize_path "$XRAY_PATH")"
-
-if [[ ! -f site/index.html ]]; then
-  cat > site/index.html <<'HTML'
+ensure_default_site() {
+  if [[ ! -f site/index.html ]]; then
+    cat > site/index.html <<'HTML'
 <!doctype html>
 <html lang="en">
 <head>
@@ -132,36 +124,66 @@ OK
 </body>
 </html>
 HTML
-fi
+  fi
+}
 
-if [[ ! -f xray/config.json.template ]]; then
-  echo "ERROR: xray/config.json.template not found"
-  exit 1
-fi
+check_required_files() {
+  local required_files=(
+    "xray/config.json.template"
+    "nginx/conf.d/default.conf.template"
+    "nginx/conf.d/bootstrap.conf.template"
+    "generate_client_config.py"
+    "docker-compose.yml"
+    "renew.sh"
+  )
 
-if [[ ! -f nginx/conf.d/default.conf.template ]]; then
-  echo "ERROR: nginx/conf.d/default.conf.template not found"
-  exit 1
-fi
+  for f in "${required_files[@]}"; do
+    if [[ ! -f "$f" ]]; then
+      echo "ERROR: required file '$f' not found"
+      exit 1
+    fi
+  done
+}
 
-if [[ ! -f nginx/conf.d/bootstrap.conf.template ]]; then
-  echo "ERROR: nginx/conf.d/bootstrap.conf.template not found"
-  exit 1
-fi
+generate_xray_config() {
+  XRAY_PATH_NORMALIZED="$(normalize_path "$XRAY_PATH")"
+  XRAY_FINGERPRINT_VALUE="${XRAY_FINGERPRINT:-chrome}"
 
-cp xray/config.json.template xray/config.json
+  cp xray/config.json.template xray/config.json
 
-replace_token xray/config.json "__XRAY_LOGLEVEL__" "$XRAY_LOGLEVEL"
-replace_token xray/config.json "__DOH_URL__" "$DOH_URL"
-replace_token xray/config.json "__XRAY_PORT__" "$XRAY_PORT"
-replace_token xray/config.json "__XRAY_UUID__" "$XRAY_UUID"
-replace_token xray/config.json "__XRAY_PATH__" "$XRAY_PATH_NORMALIZED"
-replace_token xray/config.json "__XRAY_XHTTP_MODE__" "$XRAY_XHTTP_MODE"
+  replace_token xray/config.json "__XRAY_LOGLEVEL__" "$XRAY_LOGLEVEL"
+  replace_token xray/config.json "__DOH_URL__" "$DOH_URL"
+  replace_token xray/config.json "__XRAY_PORT__" "$XRAY_PORT"
+  replace_token xray/config.json "__XRAY_UUID__" "$XRAY_UUID"
+  replace_token xray/config.json "__XRAY_PATH__" "$XRAY_PATH_NORMALIZED"
+  replace_token xray/config.json "__XRAY_XHTTP_MODE__" "$XRAY_XHTTP_MODE"
 
-CERT_DIR="certbot/conf/live/${DOMAIN}"
+  cat > generated/client.env <<EOF2
+DOMAIN=${DOMAIN}
+XRAY_UUID=${XRAY_UUID}
+XRAY_PATH=${XRAY_PATH_NORMALIZED}
+DOH_URL=${DOH_URL}
+XRAY_FINGERPRINT=${XRAY_FINGERPRINT_VALUE}
+EOF2
 
-if [[ -f "${CERT_DIR}/fullchain.pem" && -f "${CERT_DIR}/privkey.pem" ]]; then
-  echo "Certificate found. Generating full TLS + H3/H2 nginx config..."
+  chmod +x generate_client_config.py || true
+
+  python3 generate_client_config.py \
+    "$DOMAIN" \
+    "$XRAY_UUID" \
+    "$XRAY_PATH_NORMALIZED" \
+    --doh "$DOH_URL" \
+    --remark "$DOMAIN h3 fallback" \
+    --fingerprint "$XRAY_FINGERPRINT_VALUE" \
+    -o generated/client-config.json
+}
+
+render_bootstrap_nginx() {
+  cp nginx/conf.d/bootstrap.conf.template nginx/conf.d/default.conf
+  replace_token nginx/conf.d/default.conf "__DOMAIN__" "$DOMAIN"
+}
+
+render_tls_nginx() {
   prepare_cert_permissions
 
   cp nginx/conf.d/default.conf.template nginx/conf.d/default.conf
@@ -174,36 +196,95 @@ if [[ -f "${CERT_DIR}/fullchain.pem" && -f "${CERT_DIR}/privkey.pem" ]]; then
   replace_token nginx/conf.d/default.conf "__NGINX_HSTS_MAX_AGE__" "$NGINX_HSTS_MAX_AGE"
   replace_token nginx/conf.d/default.conf "__NGINX_PROXY_READ_TIMEOUT__" "$NGINX_PROXY_READ_TIMEOUT"
   replace_token nginx/conf.d/default.conf "__NGINX_PROXY_SEND_TIMEOUT__" "$NGINX_PROXY_SEND_TIMEOUT"
+}
 
-  MODE_MESSAGE="TLS certificate present. nginx should serve HTTPS + HTTP/3 + H2 fallback."
-else
-  echo "Certificate not found. Generating bootstrap HTTP-only nginx config for ACME..."
-  cp nginx/conf.d/bootstrap.conf.template nginx/conf.d/default.conf
-  replace_token nginx/conf.d/default.conf "__DOMAIN__" "$DOMAIN"
+cert_present() {
+  [[ -f "certbot/conf/live/${DOMAIN}/fullchain.pem" && -f "certbot/conf/live/${DOMAIN}/privkey.pem" ]]
+}
 
-  MODE_MESSAGE="Bootstrap mode enabled. Only HTTP/80 is expected until certificate is issued."
-fi
+print_generated_files() {
+  echo
+  echo "===== xray/config.json ====="
+  sed -n '1,260p' xray/config.json || true
 
-echo
-echo "Generated files:"
-echo "  xray/config.json"
-echo "  nginx/conf.d/default.conf"
+  echo
+  echo "===== nginx/conf.d/default.conf ====="
+  sed -n '1,260p' nginx/conf.d/default.conf || true
 
-echo
-echo "Starting xray and nginx..."
-docker compose up -d xray nginx
+  echo
+  echo "===== generated/client.env ====="
+  sed -n '1,120p' generated/client.env || true
 
-echo
-echo "Reloading generated configs..."
-docker compose restart xray nginx
+  echo
+  echo "===== generated/client-config.json ====="
+  sed -n '1,260p' generated/client-config.json || true
+}
 
-echo
-echo "${MODE_MESSAGE}"
+start_bootstrap_nginx_for_acme() {
+  log "Starting bootstrap nginx for ACME"
+  docker compose up -d --force-recreate nginx
+  sleep 2
 
-echo
-echo "===== xray/config.json ====="
-sed -n '1,240p' xray/config.json
+  echo
+  echo "Bootstrap nginx started. If certificate issuance fails, check:"
+  echo "  - DOMAIN points to this VPS"
+  echo "  - TCP/80 is open"
+  echo "  - nothing else occupies port 80"
+}
 
-echo
-echo "===== nginx/conf.d/default.conf ====="
-sed -n '1,260p' nginx/conf.d/default.conf
+main() {
+  log "Checking prerequisites"
+  verify_nginx_http3_image
+  ensure_default_site
+  check_required_files
+
+  log "Generating xray config and client artifacts"
+  generate_xray_config
+
+  if cert_present; then
+    log "Certificate found. Rendering TLS + H3/H2 nginx config"
+    render_tls_nginx
+
+    log "Starting full stack"
+    docker compose up -d --force-recreate
+
+    print_generated_files
+
+    echo
+    echo "Done."
+    echo "Certificate already exists."
+    echo "Services started in HTTPS + HTTP/3 + HTTP/2 fallback mode."
+    echo "Run ./check-h3.sh for deep diagnostics."
+    exit 0
+  fi
+
+  log "Certificate not found. Rendering bootstrap HTTP-only nginx config"
+  render_bootstrap_nginx
+
+  log "Starting bootstrap mode"
+  start_bootstrap_nginx_for_acme
+
+  log "Issuing certificate via ./renew.sh"
+  chmod +x renew.sh || true
+  ./renew.sh issue
+
+  if ! cert_present; then
+    echo "ERROR: certificate still not found after ./renew.sh issue"
+    exit 1
+  fi
+
+  log "Certificate issued. Rendering final TLS + H3/H2 nginx config"
+  render_tls_nginx
+
+  log "Starting full stack in final mode"
+  docker compose up -d --force-recreate
+
+  print_generated_files
+
+  echo
+  echo "Done."
+  echo "Certificate issued and full stack started."
+  echo "Run ./check-h3.sh for deep diagnostics."
+}
+
+main "$@"

@@ -1,76 +1,22 @@
 #!/usr/bin/env python3
 
-# py generate_client_config.py DOMAIN UUID PATH --doh https://1.1.1.1/dns-query --remark "my endpoint" -o client-config.json
-
 import argparse
 import json
 from pathlib import Path
 
 
-def normalize_path(path: str) -> str:
-    if not path.startswith("/"):
-        path = "/" + path
-    if path != "/" and not path.endswith("/"):
-        path += "/"
-    return path
-
-
-def build_config(domain: str, uuid: str, path: str, doh_url: str, remark: str | None) -> dict:
-    normalized_path = normalize_path(path)
-
-    proxy_outbound = {
-        "tag": "proxy",
-        "protocol": "vless",
-        "settings": {
-            "vnext": [
-                {
-                    "address": domain,
-                    "port": 443,
-                    "users": [
-                        {
-                            "id": uuid,
-                            "encryption": "none"
-                        }
-                    ]
-                }
-            ]
-        },
-        "streamSettings": {
-            "network": "xhttp",
-            "security": "tls",
-            "tlsSettings": {
-                "serverName": domain,
-                "fingerprint": "chrome",
-                "alpn": [
-                    "h3",
-                    "h2"
-                ]
-            },
-            "xhttpSettings": {
-                "host": domain,
-                "path": normalized_path,
-                "mode": "auto",
-                "extra": {
-                    "headers": {
-                        "Referer": f"https://{domain}/"
-                    },
-                    "xPaddingBytes": "64-512",
-                    "noGRPCHeader": True
-                }
-            }
-        }
-    }
-
-    return {
+def build_config(
+    domain: str,
+    uuid: str,
+    path: str,
+    doh: str | None,
+    remark: str,
+    fingerprint: str,
+) -> dict:
+    config = {
         "remarks": remark,
         "log": {
             "loglevel": "warning"
-        },
-        "dns": {
-            "servers": [
-                doh_url,
-                "localhost"
-            ]
         },
         "inbounds": [
             {
@@ -83,11 +29,7 @@ def build_config(domain: str, uuid: str, path: str, doh_url: str, remark: str | 
                 },
                 "sniffing": {
                     "enabled": True,
-                    "destOverride": [
-                        "http",
-                        "tls",
-                        "quic"
-                    ]
+                    "destOverride": ["http", "tls", "quic"]
                 }
             },
             {
@@ -99,7 +41,37 @@ def build_config(domain: str, uuid: str, path: str, doh_url: str, remark: str | 
             }
         ],
         "outbounds": [
-            proxy_outbound,
+            {
+                "tag": "proxy",
+                "protocol": "vless",
+                "settings": {
+                    "vnext": [
+                        {
+                            "address": domain,
+                            "port": 443,
+                            "users": [
+                                {
+                                    "id": uuid,
+                                    "encryption": "none"
+                                }
+                            ]
+                        }
+                    ]
+                },
+                "streamSettings": {
+                    "network": "xhttp",
+                    "security": "tls",
+                    "tlsSettings": {
+                        "serverName": domain,
+                        "fingerprint": fingerprint,
+                        "alpn": ["h3", "h2", "http/1.1"]
+                    },
+                    "xhttpSettings": {
+                        "path": path,
+                        "mode": "auto"
+                    }
+                }
+            },
             {
                 "tag": "direct",
                 "protocol": "freedom"
@@ -108,44 +80,48 @@ def build_config(domain: str, uuid: str, path: str, doh_url: str, remark: str | 
                 "tag": "block",
                 "protocol": "blackhole"
             }
-        ],
-        "routing": {
-            "domainStrategy": "AsIs",
-            "rules": [
-                {
-                    "type": "field",
-                    "ip": [
-                        "geoip:private"
-                    ],
-                    "outboundTag": "direct"
-                }
-            ]
-        }
+        ]
     }
+
+    if doh:
+        config["dns"] = {
+            "servers": [
+                doh,
+                "localhost"
+            ],
+            "queryStrategy": "UseIPv4"
+        }
+
+    return config
 
 
 def main() -> int:
     parser = argparse.ArgumentParser(
-        description="Generate Xray client JSON config for VLESS + XHTTP + TLS + DoH via Nginx."
+        description="Generate client config for VLESS + XHTTP + TLS/H3 fallback with uTLS fingerprint."
     )
-    parser.add_argument("domain", help="Server domain, for example: example.com")
-    parser.add_argument("uuid", help="VLESS UUID")
-    parser.add_argument("path", help="XHTTP path, for example: /api/v1/messages/")
+    parser.add_argument("domain", help="Server domain")
+    parser.add_argument("uuid", help="Client UUID")
+    parser.add_argument("path", help="XHTTP path")
     parser.add_argument(
         "--doh",
-        default="https://1.1.1.1/dns-query",
-        help="DNS-over-HTTPS URL (default: https://1.1.1.1/dns-query)",
+        default=None,
+        help="Optional DoH server URL, for example https://1.1.1.1/dns-query",
     )
     parser.add_argument(
         "--remark",
-        default=None,
-        help="Optional profile name shown by clients that read root-level remarks",
+        default="h3 fallback",
+        help="Human-readable config remark",
+    )
+    parser.add_argument(
+        "--fingerprint",
+        default="chrome",
+        help="uTLS fingerprint, for example chrome, firefox, safari",
     )
     parser.add_argument(
         "-o",
         "--output",
-        default="client-config.json",
-        help="Output JSON file path (default: client-config.json)",
+        required=True,
+        help="Output JSON file path",
     )
 
     args = parser.parse_args()
@@ -154,19 +130,19 @@ def main() -> int:
         domain=args.domain,
         uuid=args.uuid,
         path=args.path,
-        doh_url=args.doh,
+        doh=args.doh,
         remark=args.remark,
+        fingerprint=args.fingerprint,
     )
 
     output_path = Path(args.output)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
     output_path.write_text(
         json.dumps(config, ensure_ascii=False, indent=2) + "\n",
         encoding="utf-8",
     )
 
     print(f"Config written to: {output_path}")
-    if args.remark:
-        print(f"Remark: {args.remark}")
     return 0
 
 

@@ -4,7 +4,7 @@ server {
     server_name __DOMAIN__;
 
     location ^~ /.well-known/acme-challenge/ {
-        root /var/www/certbot;
+        alias /var/www/certbot/.well-known/acme-challenge/;
         default_type text/plain;
         try_files $uri =404;
     }

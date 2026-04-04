@@ -10,41 +10,89 @@ if [[ ! -f ".env" ]]; then
 fi
 
 set -a
+# shellcheck disable=SC1091
 source .env
 set +a
 
-echo "== 1. nginx image build flags =="
-docker run --rm "${NGINX_IMAGE}" nginx -V 2>&1 | tee /tmp/nginx-v.txt
-grep -- --with-http_v3_module /tmp/nginx-v.txt
+log() {
+  echo
+  echo "== $* =="
+}
 
-echo
-echo "== 2. nginx runtime config syntax =="
-docker compose exec nginx nginx -t
+print_file() {
+  local title="$1"
+  local file="$2"
 
-echo
-echo "== 3. generated nginx directives =="
-grep -nE 'listen 443|http2|http3|Alt-Svc|QUIC-Status' nginx/conf.d/default.conf || true
+  echo
+  echo "===== ${title} (${file}) ====="
+  if [[ -f "$file" ]]; then
+    sed -n '1,400p' "$file"
+  else
+    echo "FILE NOT FOUND"
+  fi
+}
 
-echo
-echo "== 4. host listening sockets =="
-sudo ss -ltnp | grep ':443' || true
-sudo ss -lunp | grep ':443' || true
+log "Recreate services"
+docker compose down || true
+docker compose up -d --force-recreate
 
-echo
-echo "== 5. container status =="
-docker compose ps
+log "docker compose ps"
+docker compose ps || true
 
-echo
-echo "== 6. HTTPS test =="
-curl -I "https://${DOMAIN}" || true
+log "Rendered configs and artifacts"
+print_file "xray config" "xray/config.json"
+print_file "nginx config" "nginx/conf.d/default.conf"
+print_file "generated client env" "generated/client.env"
+print_file "generated client config" "generated/client-config.json"
+print_file "environment" ".env"
 
-echo
-echo "== 7. HTTP/3 test =="
-curl -I --http3 "https://${DOMAIN}" || true
+log "Xray config syntax"
+docker run --rm \
+  --network host \
+  -v "$ROOT_DIR/xray:/usr/local/etc/xray:ro" \
+  "$XRAY_IMAGE" \
+  run -test -config /usr/local/etc/xray/config.json || true
 
-echo
-echo "== 8. QUIC status header =="
-curl -I --http3 "https://${DOMAIN}" | grep -i 'quic-status' || true
+log "nginx runtime config syntax"
+docker compose exec nginx nginx -t || true
 
-echo
-echo "Done."
+log "nginx image build flags"
+docker run --rm "${NGINX_IMAGE}" nginx -V 2>&1 | tee /tmp/nginx-v.txt || true
+grep -- --with-http_v3_module /tmp/nginx-v.txt || true
+
+log "Generated nginx directives"
+grep -nE 'listen 80|listen 443|http2|http3|Alt-Svc|QUIC-Status|ssl_certificate|ssl_certificate_key' nginx/conf.d/default.conf || true
+
+log "Host listening sockets"
+ss -ltnp | grep ':443' || true
+ss -lunp | grep ':443' || true
+ss -ltnp | grep ':80' || true
+
+log "HTTP test"
+curl -I --max-time 20 "http://${DOMAIN}" || true
+
+log "HTTPS test"
+curl -I --max-time 20 "https://${DOMAIN}" || true
+
+log "HTTP/3 test with curl"
+curl -I --http3 --max-time 20 "https://${DOMAIN}" || true
+
+log "QUIC status header"
+curl -I --http3 --max-time 20 "https://${DOMAIN}" | grep -i 'quic-status' || true
+
+if [[ -f "check_h3.py" ]]; then
+  log "check_h3.py"
+  python3 check_h3.py "https://${DOMAIN}" || true
+else
+  log "check_h3.py"
+  echo "check_h3.py not found, skipping"
+fi
+
+log "Container logs snapshot: xray"
+docker compose logs --tail=200 xray || true
+
+log "Container logs snapshot: nginx"
+docker compose logs --tail=200 nginx || true
+
+log "Follow logs (Ctrl+C to stop)"
+docker compose logs -f nginx xray
