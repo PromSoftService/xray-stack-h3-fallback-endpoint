@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
 
-# py generate_client_config.py DOMAIN UUID PATH --doh https://1.1.1.1/dns-query -o client-config.json
+# py generate_client_config.py DOMAIN UUID PATH --doh https://1.1.1.1/dns-query --remark "my endpoint" -o client-config.json
 
 import argparse
 import json
 from pathlib import Path
+
 
 def normalize_path(path: str) -> str:
     if not path.startswith("/"):
@@ -14,10 +15,54 @@ def normalize_path(path: str) -> str:
     return path
 
 
-def build_config(domain: str, uuid: str, path: str, doh_url: str) -> dict:
+def build_config(domain: str, uuid: str, path: str, doh_url: str, remark: str | None) -> dict:
     normalized_path = normalize_path(path)
 
+    proxy_outbound = {
+        "tag": "proxy",
+        "protocol": "vless",
+        "settings": {
+            "vnext": [
+                {
+                    "address": domain,
+                    "port": 443,
+                    "users": [
+                        {
+                            "id": uuid,
+                            "encryption": "none"
+                        }
+                    ]
+                }
+            ]
+        },
+        "streamSettings": {
+            "network": "xhttp",
+            "security": "tls",
+            "tlsSettings": {
+                "serverName": domain,
+                "fingerprint": "chrome",
+                "alpn": [
+                    "h3",
+                    "h2"
+                ]
+            },
+            "xhttpSettings": {
+                "host": domain,
+                "path": normalized_path,
+                "mode": "auto",
+                "extra": {
+                    "headers": {
+                        "Referer": f"https://{domain}/"
+                    },
+                    "xPaddingBytes": "64-512",
+                    "noGRPCHeader": True
+                }
+            }
+        }
+    }
+
     return {
+        "remarks": remark,
         "log": {
             "loglevel": "warning"
         },
@@ -54,40 +99,7 @@ def build_config(domain: str, uuid: str, path: str, doh_url: str) -> dict:
             }
         ],
         "outbounds": [
-            {
-                "tag": "proxy",
-                "protocol": "vless",
-                "settings": {
-                    "vnext": [
-                        {
-                            "address": domain,
-                            "port": 443,
-                            "users": [
-                                {
-                                    "id": uuid,
-                                    "encryption": "none"
-                                }
-                            ]
-                        }
-                    ]
-                },
-                "streamSettings": {
-                    "network": "xhttp",
-                    "security": "tls",
-                    "tlsSettings": {
-                        "serverName": domain,
-                        "fingerprint": "chrome",
-                        "alpn": [
-                            "h3"
-                        ]
-                    },
-                    "xhttpSettings": {
-                        "host": domain,
-                        "path": normalized_path,
-                        "mode": "auto"
-                    }
-                }
-            },
+            proxy_outbound,
             {
                 "tag": "direct",
                 "protocol": "freedom"
@@ -114,7 +126,7 @@ def build_config(domain: str, uuid: str, path: str, doh_url: str) -> dict:
 
 def main() -> int:
     parser = argparse.ArgumentParser(
-        description="Generate Xray client JSON config for VLESS + XHTTP3 + TLS + uTLS + DoH via Nginx."
+        description="Generate Xray client JSON config for VLESS + XHTTP + TLS + DoH via Nginx."
     )
     parser.add_argument("domain", help="Server domain, for example: example.com")
     parser.add_argument("uuid", help="VLESS UUID")
@@ -123,6 +135,11 @@ def main() -> int:
         "--doh",
         default="https://1.1.1.1/dns-query",
         help="DNS-over-HTTPS URL (default: https://1.1.1.1/dns-query)",
+    )
+    parser.add_argument(
+        "--remark",
+        default=None,
+        help="Optional profile name shown by clients that read root-level remarks",
     )
     parser.add_argument(
         "-o",
@@ -138,6 +155,7 @@ def main() -> int:
         uuid=args.uuid,
         path=args.path,
         doh_url=args.doh,
+        remark=args.remark,
     )
 
     output_path = Path(args.output)
@@ -147,6 +165,8 @@ def main() -> int:
     )
 
     print(f"Config written to: {output_path}")
+    if args.remark:
+        print(f"Remark: {args.remark}")
     return 0
 
 
