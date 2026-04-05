@@ -81,6 +81,106 @@ replace_token() {
   sed -i "s/${token}/$(escape_sed "$value")/g" "$file"
 }
 
+json_quote() {
+  local value="$1"
+  python3 - <<'PY' "$value"
+import json
+import sys
+print(json.dumps(sys.argv[1], ensure_ascii=False))
+PY
+}
+
+build_xhttp_host_fragment() {
+  local host="${XRAY_XHTTP_HOST:-}"
+
+  if [[ -z "$host" ]]; then
+    echo ""
+    return
+  fi
+
+  printf ', "host": %s' "$(json_quote "$host")"
+}
+
+build_xhttp_headers_json() {
+  python3 - <<'PY'
+import json
+import os
+import sys
+
+domain = os.environ["DOMAIN"].strip()
+headers_raw = os.environ.get("XRAY_XHTTP_HEADERS_JSON", "").strip()
+
+if not headers_raw:
+    print("")
+    raise SystemExit(0)
+
+try:
+    headers = json.loads(headers_raw)
+except json.JSONDecodeError as exc:
+    print(f"ERROR: XRAY_XHTTP_HEADERS_JSON is not valid JSON: {exc}", file=sys.stderr)
+    raise SystemExit(1)
+
+if not isinstance(headers, dict):
+    print("ERROR: XRAY_XHTTP_HEADERS_JSON must be a JSON object", file=sys.stderr)
+    raise SystemExit(1)
+
+if "Referer" not in headers and domain:
+    headers["Referer"] = f"https://{domain}/"
+
+print(json.dumps(headers, ensure_ascii=False, separators=(",", ":")))
+PY
+}
+
+build_xhttp_extra_fragment() {
+  local headers_json="$1"
+
+  XRAY_HEADERS_JSON="$headers_json" python3 - <<'PY'
+import json
+import os
+
+headers_raw = os.environ.get("XRAY_HEADERS_JSON", "").strip()
+padding = os.environ.get("XRAY_XHTTP_PADDING_BYTES", "").strip()
+
+extra = {}
+
+if headers_raw:
+    extra["headers"] = json.loads(headers_raw)
+
+if padding:
+    extra["xPaddingBytes"] = padding
+
+if not extra:
+    print("")
+else:
+    print(', "extra": ' + json.dumps(extra, ensure_ascii=False, separators=(",", ":")))
+PY
+}
+
+validate_mux_settings() {
+  local enabled="${XRAY_MUX_ENABLED:-no}"
+
+  case "$enabled" in
+    yes|no)
+      ;;
+    *)
+      echo "ERROR: XRAY_MUX_ENABLED must be 'yes' or 'no'"
+      exit 1
+      ;;
+  esac
+
+  if [[ "$enabled" == "yes" ]]; then
+    if ! [[ "${XRAY_MUX_CONCURRENCY:-}" =~ ^[0-9]+$ ]]; then
+      echo "ERROR: XRAY_MUX_CONCURRENCY must be an integer"
+      exit 1
+    fi
+
+    if ! [[ "${XRAY_MUX_XUDP_CONCURRENCY:-}" =~ ^[0-9]+$ ]]; then
+      echo "ERROR: XRAY_MUX_XUDP_CONCURRENCY must be an integer"
+      exit 1
+    fi
+  fi
+}
+
 verify_nginx_http3_image() {
   if [[ "${VERIFY_HTTP3_IMAGE:-yes}" == "yes" ]]; then
     log "Checking nginx image for --with-http_v3_module"
@@ -148,6 +248,11 @@ check_required_files() {
 generate_xray_config() {
   XRAY_PATH_NORMALIZED="$(normalize_path "$XRAY_PATH")"
   XRAY_FINGERPRINT_VALUE="${XRAY_FINGERPRINT:-chrome}"
+  XRAY_XHTTP_HOST_FRAGMENT="$(build_xhttp_host_fragment)"
+  XRAY_XHTTP_HEADERS_JSON_COMPACT="$(build_xhttp_headers_json)"
+  XRAY_XHTTP_EXTRA_FRAGMENT="$(build_xhttp_extra_fragment "$XRAY_XHTTP_HEADERS_JSON_COMPACT")"
+
+  validate_mux_settings
 
   cp xray/config.json.template xray/config.json
 
@@ -157,6 +262,8 @@ generate_xray_config() {
   replace_token xray/config.json "__XRAY_UUID__" "$XRAY_UUID"
   replace_token xray/config.json "__XRAY_PATH__" "$XRAY_PATH_NORMALIZED"
   replace_token xray/config.json "__XRAY_XHTTP_MODE__" "$XRAY_XHTTP_MODE"
+  replace_token xray/config.json "__XRAY_XHTTP_HOST_FRAGMENT__" "$XRAY_XHTTP_HOST_FRAGMENT"
+  replace_token xray/config.json "__XRAY_XHTTP_EXTRA_FRAGMENT__" "$XRAY_XHTTP_EXTRA_FRAGMENT"
 
   cat > generated/client.env <<EOF2
 DOMAIN=${DOMAIN}
@@ -164,18 +271,51 @@ XRAY_UUID=${XRAY_UUID}
 XRAY_PATH=${XRAY_PATH_NORMALIZED}
 DOH_URL=${DOH_URL}
 XRAY_FINGERPRINT=${XRAY_FINGERPRINT_VALUE}
+XRAY_XHTTP_MODE=${XRAY_XHTTP_MODE}
+XRAY_XHTTP_HOST=${XRAY_XHTTP_HOST:-}
+XRAY_XHTTP_HEADERS_JSON=${XRAY_XHTTP_HEADERS_JSON_COMPACT}
+XRAY_XHTTP_PADDING_BYTES=${XRAY_XHTTP_PADDING_BYTES:-}
+XRAY_MUX_ENABLED=${XRAY_MUX_ENABLED:-no}
+XRAY_MUX_CONCURRENCY=${XRAY_MUX_CONCURRENCY:-8}
+XRAY_MUX_XUDP_CONCURRENCY=${XRAY_MUX_XUDP_CONCURRENCY:-16}
+XRAY_MUX_XUDP_PROXY_UDP_443=${XRAY_MUX_XUDP_PROXY_UDP_443:-reject}
 EOF2
 
   chmod +x generate_client_config.py || true
 
-  python3 generate_client_config.py \
-    "$DOMAIN" \
-    "$XRAY_UUID" \
-    "$XRAY_PATH_NORMALIZED" \
-    --doh "$DOH_URL" \
-    --remark "$DOMAIN h3 fallback" \
-    --fingerprint "$XRAY_FINGERPRINT_VALUE" \
+  client_args=(
+    "$DOMAIN"
+    "$XRAY_UUID"
+    "$XRAY_PATH_NORMALIZED"
+    --doh "$DOH_URL"
+    --remark "$DOMAIN h3 fallback"
+    --fingerprint "$XRAY_FINGERPRINT_VALUE"
+    --xhttp-mode "$XRAY_XHTTP_MODE"
     -o generated/client-config.json
+  )
+
+  if [[ -n "${XRAY_XHTTP_HOST:-}" ]]; then
+    client_args+=(--xhttp-host "$XRAY_XHTTP_HOST")
+  fi
+
+  if [[ -n "$XRAY_XHTTP_HEADERS_JSON_COMPACT" ]]; then
+    client_args+=(--xhttp-headers-json "$XRAY_XHTTP_HEADERS_JSON_COMPACT")
+  fi
+
+  if [[ -n "${XRAY_XHTTP_PADDING_BYTES:-}" ]]; then
+    client_args+=(--xhttp-padding-bytes "$XRAY_XHTTP_PADDING_BYTES")
+  fi
+
+  if [[ "${XRAY_MUX_ENABLED:-no}" == "yes" ]]; then
+    client_args+=(
+      --mux-enabled
+      --mux-concurrency "${XRAY_MUX_CONCURRENCY:-8}"
+      --mux-xudp-concurrency "${XRAY_MUX_XUDP_CONCURRENCY:-16}"
+      --mux-xudp-proxy-udp-443 "${XRAY_MUX_XUDP_PROXY_UDP_443:-reject}"
+    )
+  fi
+
+  python3 generate_client_config.py "${client_args[@]}"
 }
 
 render_bootstrap_nginx() {
@@ -213,11 +353,11 @@ print_generated_files() {
 
   echo
   echo "===== generated/client.env ====="
-  sed -n '1,120p' generated/client.env || true
+  sed -n '1,160p' generated/client.env || true
 
   echo
   echo "===== generated/client-config.json ====="
-  sed -n '1,260p' generated/client-config.json || true
+  sed -n '1,320p' generated/client-config.json || true
 }
 
 start_bootstrap_nginx_for_acme() {

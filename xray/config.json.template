@@ -25,7 +25,7 @@
         "network": "xhttp",
         "xhttpSettings": {
           "path": "__XRAY_PATH__",
-          "mode": "__XRAY_XHTTP_MODE__"
+          "mode": "__XRAY_XHTTP_MODE__"__XRAY_XHTTP_HOST_FRAGMENT____XRAY_XHTTP_EXTRA_FRAGMENT__
         }
       }
     }
